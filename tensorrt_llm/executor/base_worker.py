@@ -15,7 +15,7 @@ from tensorrt_llm.logger import logger
 
 from .._torch.pyexecutor.llm_request import LlmResponse
 from .._utils import (global_mpi_rank, global_mpi_size, mpi_comm, mpi_rank,
-                      nvtx_range_debug)
+                      nvtx_range_debug, set_gc_context)
 from ..bindings import executor as tllm
 from ..builder import ConfigEncoder, Engine, EngineConfig
 from ..llmapi.llm_args import BaseLlmArgs, PybindMirror
@@ -112,6 +112,13 @@ class BaseWorker(GenerationExecutor):
         self._backend = None if llm_args is None else llm_args.backend
         self._is_pytorch_backend = self._backend in ["pytorch", "_autodeploy"]
         self._lora_config = llm_args.lora_config if self._is_pytorch_backend else None
+        self._iter_counter = 0
+        set_gc_context(
+            backend=self._backend if self._backend else "trt",
+            rank=self.rank,
+            global_rank=self.global_rank,
+            _iter_fn=lambda: self._iter_counter,
+        )
 
         if global_mpi_size() > 1:
             logger.set_rank(self.global_rank)
@@ -299,6 +306,10 @@ class BaseWorker(GenerationExecutor):
     def fetch_stats(self) -> list:
         if isinstance(self.engine, tllm.Executor):
             iter_stats = self.engine.get_latest_iteration_stats()
+            if iter_stats:
+                latest_iter = getattr(iter_stats[-1], 'iter', None)
+                if latest_iter is not None:
+                    self._iter_counter = latest_iter
             #TODO: Support req stats with TRT engine
             #      This would require ensuring iter and req stats have same size
             return [(iter_stat, None) for iter_stat in iter_stats]

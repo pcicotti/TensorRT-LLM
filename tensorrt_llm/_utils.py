@@ -23,6 +23,8 @@ import socket
 import struct
 import sys
 import tempfile
+import threading
+import time
 import trace
 import traceback
 import weakref
@@ -1325,6 +1327,67 @@ def is_device_integrated() -> bool:
 # Set to "1" to enable recording of garbage collection events during profiling.
 PROFILE_RECORD_GC_ENV_VAR_NAME = "TLLM_PROFILE_RECORD_GC"
 
+# Process-level GC context (one per process; each MPI rank is a separate process)
+class GCContext:
+    """Context information for GC stats logging."""
+
+    def __init__(self):
+        self.rank: Optional[int] = None
+        self.global_rank: Optional[int] = None
+        self.backend: Optional[str] = "N/A"
+        self._iter_fn: Optional[Callable[[], int]] = None
+        self.process_type: str = "N/A"
+
+
+_gc_context = GCContext()
+
+
+def get_gc_context() -> GCContext:
+    """Get the process-level GC context."""
+    return _gc_context
+
+
+def set_gc_context(**kwargs):
+    """Update GC context with provided fields.
+
+    Use _iter_fn=callable to provide a lazy iteration getter
+    (called at log time).
+    """
+    ctx = get_gc_context()
+    for key, value in kwargs.items():
+        if hasattr(ctx, key):
+            setattr(ctx, key, value)
+
+    process_parts = [f"backend={ctx.backend}"]
+    if ctx.rank is not None:
+        process_parts.append(f"rank={ctx.rank}")
+    if ctx.global_rank is not None:
+        process_parts.append(f"global_rank={ctx.global_rank}")
+    ctx.process_type = ", ".join(process_parts)
+
+
+
+def _log_gc_stats(info: dict, duration_ms: float, steady_clock_ts: float):
+    """Log GC statistics with context information."""
+    ctx = get_gc_context()
+
+    generation = info.get('generation', 'N/A')
+    collected = info.get('collected', 0)
+    uncollectable = info.get('uncollectable', 0)
+
+    iteration = str(ctx._iter_fn()) if ctx._iter_fn is not None else "N/A"
+
+    logger.info(
+        f"[GC Stats] "
+        f"timestamp_s={steady_clock_ts:.6f}, "
+        f"iteration={iteration}, "
+        f"process=({ctx.process_type}), "
+        f"generation={generation}, "
+        f"collected={collected}, "
+        f"uncollectable={uncollectable}, "
+        f"duration_ms={duration_ms:.2f}"
+    )
+
 
 class _GCNvtxHandle:
     """Handle object for GC NVTX watcher to keep it alive."""
@@ -1387,3 +1450,91 @@ def _setup_gc_nvtx_profiling() -> Optional[_GCNvtxHandle]:
 
 # Initialize GC NVTX profiling singleton at module import time
 _setup_gc_nvtx_profiling()
+
+
+class _GCStatsHandle:
+    """Handle object for GC stats watcher to keep it alive."""
+
+
+_gc_stats_handle: Optional[_GCStatsHandle] = None
+
+
+def _setup_gc_stats_logging() -> Optional[_GCStatsHandle]:
+    """Set up a separate GC callback for statistics logging.
+
+    Enabled when both TLLM_PERF_INTERNALS=1 and TLLM_PROFILE_RECORD_GC=1
+    are set. This callback is independent of the NVTX profiling callback.
+    """
+    global _gc_stats_handle
+
+    if _gc_stats_handle is not None:
+        return _gc_stats_handle
+
+    perf_internals_enabled = os.environ.get("TLLM_PERF_INTERNALS", None)
+    gc_record_enabled = os.environ.get(PROFILE_RECORD_GC_ENV_VAR_NAME, None)
+
+    if not perf_internals_enabled or not gc_record_enabled:
+        return None
+
+    if not gc.isenabled():
+        logger.info(
+            "[GC Config] GC stats logging enabled but Python GC is disabled. "
+            "No stats will be collected.")
+        return None
+
+    # Initialize GC context with rank info available at import time
+    set_gc_context(
+        rank=mpi_rank(),
+        global_rank=global_mpi_rank(),
+    )
+
+    try:
+        thresholds = gc.get_threshold()
+        tracked_objects = gc.get_count()
+        logger.info(
+            f"[GC Config] "
+            f"enabled=True, "
+            f"thresholds=(gen0={thresholds[0]}, gen1={thresholds[1]}, gen2={thresholds[2]}), "
+            f"tracked_objects=(gen0={tracked_objects[0]}, gen1={tracked_objects[1]}, gen2={tracked_objects[2]})"
+        )
+    except Exception as e:
+        logger.warning(f"Error logging GC configuration: {e}")
+
+    from tensorrt_llm.bindings import steady_clock_now
+
+    gc_start_time: Optional[float] = None
+
+    def gc_stats_callback(phase, info):
+        nonlocal gc_start_time
+
+        if phase == "start":
+            gc_start_time = time.perf_counter()
+        elif phase == "stop":
+            if gc_start_time is not None:
+                try:
+                    steady_ts = steady_clock_now().total_seconds()
+                    duration_ms = (time.perf_counter() -
+                                   gc_start_time) * 1000.0
+                    _log_gc_stats(info, duration_ms, steady_ts)
+                except Exception as e:
+                    logger.warning(f"Error logging GC stats: {e}")
+                finally:
+                    gc_start_time = None
+
+    gc.callbacks.append(gc_stats_callback)
+
+    def gc_cleanup(callback):
+        try:
+            gc.callbacks.remove(callback)
+        except ValueError:
+            pass
+
+    handle = _GCStatsHandle()
+    weakref.finalize(handle, gc_cleanup, gc_stats_callback)
+
+    _gc_stats_handle = handle
+    return handle
+
+
+# Initialize GC stats logging singleton at module import time
+_setup_gc_stats_logging()

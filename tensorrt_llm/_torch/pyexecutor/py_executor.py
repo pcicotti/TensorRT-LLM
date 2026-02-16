@@ -24,7 +24,8 @@ except ImportError:
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     ResourceManagerType, request_context)
 from tensorrt_llm._utils import (customized_gc_thresholds, is_trace_enabled,
-                                 mpi_disabled, nvtx_range, trace_func)
+                                 mpi_disabled, nvtx_range, set_gc_context,
+                                 trace_func)
 from tensorrt_llm.bindings.executor import (DisServingRequestStats,
                                             FinishReason, InflightBatchingStats,
                                             IterationStats, KvCacheStats,
@@ -281,6 +282,12 @@ class PyExecutor:
         self.peft_cache_config = peft_cache_config
 
         self.iter_counter = 0
+        set_gc_context(
+            backend="pytorch",
+            rank=dist.rank if dist else None,
+            global_rank=self.global_rank,
+            _iter_fn=lambda: self.iter_counter,
+        )
         # profile config
         self.profile_start_iters, self.profile_stop_iters = _load_iteration_indexes(
             PROFILE_START_STOP_ENV_VAR_NAME)
