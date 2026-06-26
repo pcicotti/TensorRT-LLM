@@ -37,7 +37,8 @@ from ..attention_backend.utils import get_attention_backend
 from ..attention_backend.vanilla import VanillaAttentionMetadata
 from ..autotuner import AutoTuner, autotune
 from ..compilation.backend import Backend
-from ..compilation.utils import capture_piecewise_cuda_graph
+from ..compilation.utils import (capture_piecewise_cuda_graph,
+                                 capture_piecewise_cuda_graph_draft)
 from ..distributed import Distributed
 from ..distributed.communicator import init_pp_comm
 from ..expert_statistic import ExpertStatistic
@@ -1143,16 +1144,17 @@ class PyTorchModelEngine(ModelEngine):
                     gc.collect()
                     torch.cuda.empty_cache()
 
-            # Eagle3 one-model warmup: sweep over gen CUDA graph batch sizes, creating
-            # N single-token context requests per batch size N. This exercises the
-            # gen-only iterations (2+) of the Eagle3 drafting loop at each batch size,
-            # making them available for future graph capture.
-            is_eagle3_one_model = (self.enable_spec_decode and isinstance(
-                self.spec_config, EagleDecodingConfig)
-                                   and self.spec_config.eagle3_one_model)
-            if is_eagle3_one_model and self.spec_config.capture_batch_sizes:
-                eagle3_batch_sizes = sorted(
-                    self.spec_config.capture_batch_sizes, reverse=True)
+        # Eagle3 one-model warmup: sweep over gen CUDA graph batch sizes, creating
+        # N single-token context requests per batch size N. This exercises the
+        # gen-only iterations (2+) of the Eagle3 drafting loop at each batch size,
+        # making them available for future graph capture.
+        is_eagle3_one_model = (self.enable_spec_decode and isinstance(
+            self.spec_config, EagleDecodingConfig)
+                               and self.spec_config.eagle3_one_model)
+        if is_eagle3_one_model and self.spec_config.capture_batch_sizes:
+            eagle3_batch_sizes = sorted(self.spec_config.capture_batch_sizes,
+                                        reverse=True)
+            with capture_piecewise_cuda_graph_draft(True), self.no_cuda_graph():
                 for batch_size in eagle3_batch_sizes:
                     warmup_request = self._create_warmup_request(
                         resource_manager,

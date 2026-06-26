@@ -8,7 +8,7 @@ from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
-#from ..compilation.utils import get_capture_piecewise_cuda_graph_flag
+from ..compilation.utils import get_capture_piecewise_cuda_graph_draft_flag
 from ..pyexecutor.llm_request import LlmRequest
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
 from ..pyexecutor.sampler import TorchSampler
@@ -485,13 +485,10 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         self.spec_tree_manager = None
         # Per-batch-size CUDA graphs for draft iterations i >= 1 (context steps only).
         # Keyed by batch_size; captured during piecewise CUDA graph warmup.
-        #self._draft_iter_graphs: Dict[int,
-        #                              Optional[torch.cuda.CUDAGraph]] = {}
-        #self._draft_iter_static_inputs: Dict[int, Dict[str,
-        #                                                torch.Tensor]] = {}
-        #self._draft_iter_static_outputs: Dict[int, Dict[str,
-        #                                                 torch.Tensor]] = {}
-        #self._draft_iter_warmup_counts: Dict[int, int] = {}
+        self._draft_iter_graphs: Dict[int, Optional[torch.cuda.CUDAGraph]] = {}
+        self._draft_iter_static_inputs: Dict[int, Dict[str, torch.Tensor]] = {}
+        self._draft_iter_static_outputs: Dict[int, Dict[str, torch.Tensor]] = {}
+        self._draft_iter_warmup_counts: Dict[int, int] = {}
 
     @property
     def max_draft_len(self) -> int:
@@ -732,6 +729,16 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 "spec_metadata": spec_metadata,
             }
 
+        def run_trailing_iterations(n, inputs, gather_ids,
+                                    update_attn_metadata):
+            for i in range(1, n):
+                gather_ids = spec_metadata.batch_indices_cuda[:batch_size]
+                if spec_metadata.all_rank_num_seqs is not None:
+                    attn_metadata.all_rank_num_tokens = spec_metadata.all_rank_num_seqs
+                inputs = run_iteration(i, inputs, gather_ids,
+                                       update_attn_metadata)
+            return inputs
+
         with self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager):
             num_gens = batch_size - num_contexts
             start_ids_gen = (spec_metadata.batch_indices_cuda[:num_gens] *
@@ -747,12 +754,41 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 attn_metadata.all_rank_num_tokens = original_all_rank_num_tokens
             inputs = run_iteration(0, inputs, gather_ids,
                                    update_attn_metadata_0)
-            for i in range(1, runtime_draft_len):
-                gather_ids = spec_metadata.batch_indices_cuda[:batch_size]
-                if spec_metadata.all_rank_num_seqs is not None:
-                    attn_metadata.all_rank_num_tokens = spec_metadata.all_rank_num_seqs
-                inputs = run_iteration(i, inputs, gather_ids,
-                                       update_attn_metadata_i)
+
+            capture_batch_sizes = getattr(self.spec_config,
+                                          'capture_batch_sizes', [])
+            can_draft_graph = (not spec_metadata.use_rejection_sampling
+                               and self.guided_decoder is None
+                               and num_contexts > 0
+                               and batch_size in capture_batch_sizes)
+            if can_draft_graph:
+                if get_capture_piecewise_cuda_graph_draft_flag():
+                    count = self._draft_iter_warmup_counts.get(batch_size, 0)
+                    self._draft_iter_warmup_counts[batch_size] = count + 1
+                    if count < 3:
+                        print(
+                            f"warming eagle graph for batch size {batch_size}")
+                    elif count == 3:
+                        print(
+                            f"capturing eagle graph for batch size {batch_size}"
+                        )
+                    else:
+                        print(
+                            f"replaying eagle graph for batch size {batch_size}"
+                        )
+                    inputs = run_trailing_iterations(runtime_draft_len, inputs,
+                                                     gather_ids,
+                                                     update_attn_metadata_i)
+                else:
+                    print(f"maybe eagle graph for batch size {batch_size}")
+                    inputs = run_trailing_iterations(runtime_draft_len, inputs,
+                                                     gather_ids,
+                                                     update_attn_metadata_i)
+            else:
+                print(f"executing eagle graph for batch size {batch_size}")
+                inputs = run_trailing_iterations(runtime_draft_len, inputs,
+                                                 gather_ids,
+                                                 update_attn_metadata_i)
 
         next_draft_tokens = torch.stack(next_draft_tokens, dim=1)
 

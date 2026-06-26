@@ -56,6 +56,29 @@ def capture_piecewise_cuda_graph(enable: bool):
         set_capture_piecewise_cuda_graph_flag(prev_enable)
 
 
+_enable_piecewise_cuda_graph_capture_draft = False
+
+
+def set_capture_piecewise_cuda_graph_draft_flag(enable: bool):
+    global _enable_piecewise_cuda_graph_capture_draft
+    _enable_piecewise_cuda_graph_capture_draft = enable
+
+
+def get_capture_piecewise_cuda_graph_draft_flag() -> bool:
+    global _enable_piecewise_cuda_graph_capture_draft
+    return _enable_piecewise_cuda_graph_capture_draft
+
+
+@contextlib.contextmanager
+def capture_piecewise_cuda_graph_draft(enable: bool):
+    prev_enable = get_capture_piecewise_cuda_graph_draft_flag()
+    set_capture_piecewise_cuda_graph_draft_flag(enable)
+    try:
+        yield
+    finally:
+        set_capture_piecewise_cuda_graph_draft_flag(prev_enable)
+
+
 def inplace_info():
     inplace_map = {
         torch.ops.trtllm.flashinfer_fused_add_rmsnorm.default: {
