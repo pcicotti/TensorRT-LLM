@@ -1185,6 +1185,11 @@ class EagleDecodingConfig(DecodingBaseConfig):
     eagle3_model_arch: Literal["llama3", "mistral_large3"] = Field(
         default="llama3",
         description="The model architecture of the eagle3 model.")
+    capture_batch_sizes: List[int] = Field(
+        default_factory=list,
+        description=
+        "Generation CUDA graph batch sizes for Eagle3 draft-loop graph capture. "
+        "Only valid when eagle3_one_model=True.")
 
     @field_validator('eagle_choices', mode='before')
     @classmethod
@@ -1210,6 +1215,10 @@ class EagleDecodingConfig(DecodingBaseConfig):
             logger.warning(
                 "Eagle3 2-model is deprecated and will be removed in release 1.4."
             )
+            if self.capture_batch_sizes:
+                raise ValueError(
+                    "capture_batch_sizes is only valid when eagle3_one_model=True"
+                )
 
         self.num_eagle_layers = self.max_draft_len
 

@@ -23,8 +23,8 @@ from tensorrt_llm.inputs.multimodal import (MultimodalParams,
                                             check_mm_embed_cumsum_if_needed)
 from tensorrt_llm.inputs.registry import (create_input_processor,
                                           create_input_processor_with_hash)
-from tensorrt_llm.llmapi.llm_args import (CudaGraphConfig, TorchCompileConfig,
-                                          TorchLlmArgs)
+from tensorrt_llm.llmapi.llm_args import (CudaGraphConfig, EagleDecodingConfig,
+                                          TorchCompileConfig, TorchLlmArgs)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.lora_manager import LoraModelConfig
@@ -478,6 +478,15 @@ class PyTorchModelEngine(ModelEngine):
                                            self._cuda_graph_batch_sizes else 0)
         self._dynamic_draft_len_mapping = self._compute_dynamic_draft_len_mapping(
         )
+
+        if isinstance(self.spec_config, EagleDecodingConfig):
+            if self.spec_config.capture_batch_sizes:
+                self.spec_config.capture_batch_sizes = _filter_cuda_graph_batch_sizes(
+                    self.spec_config.capture_batch_sizes, self.batch_size,
+                    self.max_num_tokens, self.original_max_total_draft_tokens,
+                    self._cuda_graph_padding_enabled)
+            else:
+                self.spec_config.capture_batch_sizes = self._cuda_graph_batch_sizes
 
         self.previous_batch_indices_cuda = torch.empty((self.max_num_tokens, ),
                                                        dtype=torch.int,
@@ -1133,6 +1142,43 @@ class PyTorchModelEngine(ModelEngine):
                     torch.cuda.synchronize()
                     gc.collect()
                     torch.cuda.empty_cache()
+
+            # Eagle3 one-model warmup: sweep over gen CUDA graph batch sizes, creating
+            # N single-token context requests per batch size N. This exercises the
+            # gen-only iterations (2+) of the Eagle3 drafting loop at each batch size,
+            # making them available for future graph capture.
+            is_eagle3_one_model = (self.enable_spec_decode and isinstance(
+                self.spec_config, EagleDecodingConfig)
+                                   and self.spec_config.eagle3_one_model)
+            if is_eagle3_one_model and self.spec_config.capture_batch_sizes:
+                eagle3_batch_sizes = sorted(
+                    self.spec_config.capture_batch_sizes, reverse=True)
+                for batch_size in eagle3_batch_sizes:
+                    warmup_request = self._create_warmup_request(
+                        resource_manager,
+                        num_tokens=batch_size,
+                        num_gen_requests=0,
+                        least_requests=False)
+                    with self._release_batch_context(warmup_request,
+                                                     resource_manager) as batch:
+                        if batch is None:
+                            continue
+
+                        logger.info(
+                            f"Run Eagle3 piecewise CUDA graph warmup for batch size={batch_size}"
+                        )
+                        # Run a few times to ensure capture
+                        for _ in range(3):
+                            self.forward(batch,
+                                         new_tensors_device=None,
+                                         resource_manager=resource_manager)
+
+                        self.forward(batch,
+                                     new_tensors_device=None,
+                                     resource_manager=resource_manager)
+                        torch.cuda.synchronize()
+                        gc.collect()
+                        torch.cuda.empty_cache()
 
         # When using piecewise cuda graph, the logits may suffer severe memory fragmentation problem.
         # As the number of requests grows, the blocks allocated by torch cannot be reused.

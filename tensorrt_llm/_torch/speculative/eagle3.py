@@ -8,6 +8,7 @@ from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
+#from ..compilation.utils import get_capture_piecewise_cuda_graph_flag
 from ..pyexecutor.llm_request import LlmRequest
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
 from ..pyexecutor.sampler import TorchSampler
@@ -482,6 +483,15 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             self.sa_enhancer = SADraftEnhancer(spec_config.sa_config.threshold)
         self.use_dynamic_tree = getattr(spec_config, 'use_dynamic_tree', False)
         self.spec_tree_manager = None
+        # Per-batch-size CUDA graphs for draft iterations i >= 1 (context steps only).
+        # Keyed by batch_size; captured during piecewise CUDA graph warmup.
+        #self._draft_iter_graphs: Dict[int,
+        #                              Optional[torch.cuda.CUDAGraph]] = {}
+        #self._draft_iter_static_inputs: Dict[int, Dict[str,
+        #                                                torch.Tensor]] = {}
+        #self._draft_iter_static_outputs: Dict[int, Dict[str,
+        #                                                 torch.Tensor]] = {}
+        #self._draft_iter_warmup_counts: Dict[int, int] = {}
 
     @property
     def max_draft_len(self) -> int:
@@ -662,92 +672,88 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         runtime_draft_len = spec_metadata.runtime_draft_len
         next_draft_tokens = []
         draft_logits_list = []
-        position_ids = inputs["position_ids"]
 
-        with self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager):
-            for i in range(runtime_draft_len):
-                if i == 0:
-                    num_gens = batch_size - num_contexts
-                    start_ids_gen = (
-                        spec_metadata.batch_indices_cuda[:num_gens] *
-                        (runtime_draft_len + 1)).long()
-                    gather_ids_gen = (start_ids_gen +
-                                      num_accepted_tokens[num_contexts:] - 1 +
-                                      attn_metadata.num_ctx_tokens)
-                    gather_ids = torch.concat([
-                        spec_metadata.gather_ids[:num_contexts], gather_ids_gen
-                    ],
-                                              dim=0)
-                else:
-                    # All of the seq_len are 1, use batch_indices_cuda as gather_ids
-                    gather_ids = spec_metadata.batch_indices_cuda[:batch_size]
+        def update_attn_metadata_0(attn_metadata):
+            attn_metadata._seq_lens[:batch_size].fill_(1)
+            attn_metadata._seq_lens_cuda[:batch_size].fill_(1)
+            attn_metadata.on_update()
+            # cannot run generation if there is no kv cache
+            if attn_metadata.kv_cache_manager is not None:
+                attn_metadata.host_request_types[:attn_metadata.
+                                                 num_contexts].fill_(1)
+                attn_metadata.num_contexts = 0
+            if hasattr(attn_metadata, 'kv_lens_cuda'):
+                attn_metadata.kv_lens_cuda[num_contexts:batch_size] -= (
+                    runtime_draft_len - num_accepted_tokens[num_contexts:])
+                attn_metadata.kv_lens_cuda[:num_contexts] += 1
 
-                if self.guided_decoder is not None:
-                    new_tokens = inputs["input_ids"][gather_ids]
-                    self.guided_decoder.add_draft_batch(new_tokens,
-                                                        num_accepted_tokens,
+        def update_attn_metadata_i(attn_metadata):
+            if hasattr(attn_metadata, 'kv_lens_cuda'):
+                attn_metadata.kv_lens_cuda[:batch_size] += 1
+
+        def run_iteration(i, inputs, gather_ids, update_attn_metadata):
+            if self.guided_decoder is not None:
+                new_tokens = inputs["input_ids"][gather_ids]
+                self.guided_decoder.add_draft_batch(new_tokens,
+                                                    num_accepted_tokens,
+                                                    draft_step=i)
+
+            hidden_states, hidden_states_to_save = draft_model.model(**inputs)
+
+            # FIXME (jhaotingc): Currently we disable use_spec_decoding mode for Eagle engine nth steps except 1st step.
+            # Eagle engine takes in draft_len tokens from the previous step, run spec-dec mode with those tokens,
+            # then the following step can use regular decoding mode to generate 1 tokens per step.
+            # Currently the spec-dec mask for chained tree is not implemented yet.
+            # When token tree is supported, this can be removed and all steps may use spec-dec mode as well.
+            attn_metadata.use_spec_decoding = False
+
+            logits = draft_model.logits_processor(hidden_states[gather_ids],
+                                                  draft_model.lm_head,
+                                                  attn_metadata, True)
+            if self.guided_decoder is not None:
+                d2t = getattr(draft_model.model, "d2t", None)
+                self.guided_decoder.execute_draft_batch(logits,
+                                                        d2t,
                                                         draft_step=i)
 
-                # Update attn_metadata.all_rank_num_tokens for attention DP
-                if original_all_rank_num_tokens is not None:
-                    if i == 0:
-                        attn_metadata.all_rank_num_tokens = original_all_rank_num_tokens
-                    elif spec_metadata.all_rank_num_seqs is not None:
-                        attn_metadata.all_rank_num_tokens = spec_metadata.all_rank_num_seqs
+            if spec_metadata.use_rejection_sampling:
+                draft_logits_list.append(logits.clone())
 
-                hidden_states, hidden_states_to_save = draft_model.model(
-                    **inputs)
+            new_draft_token = self.draft_decoder(logits, draft_model)
+            next_draft_tokens.append(new_draft_token)
+            hidden_states = hidden_states_to_save[gather_ids]
+            position_ids = inputs["position_ids"][gather_ids] + 1
+            update_attn_metadata(attn_metadata)
+            return {
+                "input_ids": new_draft_token,
+                "position_ids": position_ids,
+                "hidden_states": hidden_states,
+                "attn_metadata": attn_metadata,
+                "spec_metadata": spec_metadata,
+            }
 
-                # FIXME (jhaotingc): Currently we disable use_spec_decoding mode for Eagle engine nth steps except 1st step.
-                # Eagle engine takes in draft_len tokens from the previous step, run spec-dec mode with those tokens,
-                # then the following step can use regular decoding mode to generate 1 tokens per step.
-                # Currently the spec-dec mask for chained tree is not implemented yet.
-                # When token tree is supported, this can be removed and all steps may use spec-dec mode as well.
-                attn_metadata.use_spec_decoding = False
+        with self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager):
+            num_gens = batch_size - num_contexts
+            start_ids_gen = (spec_metadata.batch_indices_cuda[:num_gens] *
+                             (runtime_draft_len + 1)).long()
+            gather_ids_gen = (start_ids_gen +
+                              num_accepted_tokens[num_contexts:] - 1 +
+                              attn_metadata.num_ctx_tokens)
+            gather_ids = torch.concat(
+                [spec_metadata.gather_ids[:num_contexts], gather_ids_gen],
+                dim=0)
+            # Update attn_metadata.all_rank_num_tokens for attention DP
+            if original_all_rank_num_tokens is not None:
+                attn_metadata.all_rank_num_tokens = original_all_rank_num_tokens
+            inputs = run_iteration(0, inputs, gather_ids,
+                                   update_attn_metadata_0)
+            for i in range(1, runtime_draft_len):
+                gather_ids = spec_metadata.batch_indices_cuda[:batch_size]
+                if spec_metadata.all_rank_num_seqs is not None:
+                    attn_metadata.all_rank_num_tokens = spec_metadata.all_rank_num_seqs
+                inputs = run_iteration(i, inputs, gather_ids,
+                                       update_attn_metadata_i)
 
-                logits = draft_model.logits_processor(hidden_states[gather_ids],
-                                                      draft_model.lm_head,
-                                                      attn_metadata, True)
-                if self.guided_decoder is not None:
-                    d2t = getattr(draft_model.model, "d2t", None)
-                    self.guided_decoder.execute_draft_batch(logits,
-                                                            d2t,
-                                                            draft_step=i)
-
-                if spec_metadata.use_rejection_sampling:
-                    draft_logits_list.append(logits.clone())
-
-                new_draft_token = self.draft_decoder(logits, draft_model)
-                next_draft_tokens.append(new_draft_token)
-                # update inputs
-                hidden_states = hidden_states_to_save[gather_ids]
-                position_ids = inputs["position_ids"][gather_ids] + 1
-                # update attn_metadata
-                if i == 0:
-                    attn_metadata._seq_lens[:batch_size].fill_(1)
-                    attn_metadata._seq_lens_cuda[:batch_size].fill_(1)
-                    attn_metadata.on_update()
-                    # cannot run generation if there is no kv cache
-                    if inputs["attn_metadata"].kv_cache_manager is not None:
-                        attn_metadata.host_request_types[:attn_metadata.
-                                                         num_contexts].fill_(1)
-                        attn_metadata.num_contexts = 0
-                    # update kv_lens_cuda
-                    if hasattr(attn_metadata, 'kv_lens_cuda'):
-                        attn_metadata.kv_lens_cuda[num_contexts:batch_size] -= (
-                            runtime_draft_len -
-                            num_accepted_tokens[num_contexts:])
-                        attn_metadata.kv_lens_cuda[:num_contexts] += 1
-                elif hasattr(attn_metadata, 'kv_lens_cuda'):
-                    attn_metadata.kv_lens_cuda[:batch_size] += 1
-                # support attention dp
-                inputs = {
-                    "input_ids": new_draft_token,
-                    "position_ids": position_ids,
-                    "hidden_states": hidden_states,
-                    "attn_metadata": attn_metadata,
-                    "spec_metadata": spec_metadata,
-                }
         next_draft_tokens = torch.stack(next_draft_tokens, dim=1)
 
         # Override with SA draft tokens after all draft layers have run,
