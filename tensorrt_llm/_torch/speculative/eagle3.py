@@ -13,6 +13,7 @@ from ..pyexecutor.llm_request import LlmRequest
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
 from ..pyexecutor.sampler import TorchSampler
 from ..pyexecutor.scheduler import ScheduledRequests
+from ..utils import make_weak_ref
 from .interface import SpecMetadata, SpecWorkerBase
 from .mtp import MTPSampler
 from .sa_enhancer import SADraftEnhancer
@@ -487,8 +488,9 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         # Keyed by batch_size; captured during piecewise CUDA graph warmup.
         self._draft_iter_graphs: Dict[int, Optional[torch.cuda.CUDAGraph]] = {}
         self._draft_iter_static_inputs: Dict[int, Dict[str, torch.Tensor]] = {}
-        self._draft_iter_static_outputs: Dict[int, Dict[str, torch.Tensor]] = {}
+        self._draft_iter_static_outputs: Dict[int, List[torch.Tensor]] = {}
         self._draft_iter_warmup_counts: Dict[int, int] = {}
+        self._draft_memory_pool = None
 
     @property
     def max_draft_len(self) -> int:
@@ -766,26 +768,64 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                     count = self._draft_iter_warmup_counts.get(batch_size, 0)
                     self._draft_iter_warmup_counts[batch_size] = count + 1
                     if count < 3:
-                        print(
-                            f"warming eagle graph for batch size {batch_size}")
+                        #print(
+                        #    f"warming eagle graph for batch size {batch_size}")
+                        inputs = run_trailing_iterations(
+                            runtime_draft_len, inputs, gather_ids,
+                            update_attn_metadata_i)
                     elif count == 3:
-                        print(
-                            f"capturing eagle graph for batch size {batch_size}"
-                        )
+                        static_inputs = {
+                            "input_ids": inputs["input_ids"].clone(),
+                            "position_ids": inputs["position_ids"].clone(),
+                            "hidden_states": inputs["hidden_states"].clone(),
+                            "attn_metadata": inputs["attn_metadata"],
+                            "spec_metadata": inputs["spec_metadata"],
+                        }
+                        self._draft_iter_static_inputs[
+                            batch_size] = static_inputs
+                        graph = torch.cuda.CUDAGraph()
+                        pool_kwargs = ({
+                            "pool": self._draft_memory_pool
+                        } if self._draft_memory_pool is not None else {})
+                        with torch.cuda.graph(graph, **pool_kwargs):
+                            run_trailing_iterations(runtime_draft_len,
+                                                    dict(static_inputs),
+                                                    gather_ids,
+                                                    update_attn_metadata_i)
+                        self._draft_iter_graphs[batch_size] = graph
+                        self._draft_iter_static_outputs[
+                            batch_size] = make_weak_ref(next_draft_tokens[1:])
+                        self._draft_memory_pool = graph.pool()
                     else:
-                        print(
-                            f"replaying eagle graph for batch size {batch_size}"
-                        )
-                    inputs = run_trailing_iterations(runtime_draft_len, inputs,
-                                                     gather_ids,
-                                                     update_attn_metadata_i)
+                        static_inputs = self._draft_iter_static_inputs[
+                            batch_size]
+                        static_inputs["input_ids"].copy_(inputs["input_ids"])
+                        static_inputs["position_ids"].copy_(
+                            inputs["position_ids"])
+                        static_inputs["hidden_states"].copy_(
+                            inputs["hidden_states"])
+                        self._draft_iter_graphs[batch_size].replay()
+                        next_draft_tokens.extend(
+                            self._draft_iter_static_outputs[batch_size])
                 else:
-                    print(f"maybe eagle graph for batch size {batch_size}")
-                    inputs = run_trailing_iterations(runtime_draft_len, inputs,
-                                                     gather_ids,
-                                                     update_attn_metadata_i)
+                    graph = self._draft_iter_graphs.get(batch_size)
+                    if graph is not None:
+                        static_inputs = self._draft_iter_static_inputs[
+                            batch_size]
+                        static_inputs["input_ids"].copy_(inputs["input_ids"])
+                        static_inputs["position_ids"].copy_(
+                            inputs["position_ids"])
+                        static_inputs["hidden_states"].copy_(
+                            inputs["hidden_states"])
+                        graph.replay()
+                        next_draft_tokens.extend(
+                            self._draft_iter_static_outputs[batch_size])
+                    else:
+                        inputs = run_trailing_iterations(
+                            runtime_draft_len, inputs, gather_ids,
+                            update_attn_metadata_i)
             else:
-                print(f"executing eagle graph for batch size {batch_size}")
+                #print(f"executing eagle graph for batch size {batch_size}")
                 inputs = run_trailing_iterations(runtime_draft_len, inputs,
                                                  gather_ids,
                                                  update_attn_metadata_i)
