@@ -492,6 +492,23 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         self._draft_iter_warmup_counts: Dict[int, int] = {}
         self._draft_memory_pool = None
 
+    def _update_draft_static_attn(self, batch_size: int, attn_metadata) -> None:
+        # graph.replay() reads from the GPU addresses baked in at capture time (the
+        # warmup batch's tensors). Copy the current batch's live values into those
+        # fixed-address buffers so the replayed kernels see valid KV data.
+        # Must be called inside draft_kv_cache_context so kv_cache_block_offsets
+        # already points to the draft block offsets.
+        capture_attn = self._draft_iter_static_inputs[batch_size][
+            "attn_metadata"]
+        draft_offsets = getattr(capture_attn, 'draft_kv_cache_block_offsets',
+                                None)
+        if draft_offsets is not None:
+            draft_offsets.copy_(attn_metadata.kv_cache_block_offsets)
+        else:
+            capture_attn.kv_cache_block_offsets.copy_(
+                attn_metadata.kv_cache_block_offsets)
+        capture_attn.kv_lens_cuda.copy_(attn_metadata.kv_lens_cuda)
+
     @property
     def max_draft_len(self) -> int:
         return self.spec_config.max_draft_len
@@ -768,12 +785,26 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                     count = self._draft_iter_warmup_counts.get(batch_size, 0)
                     self._draft_iter_warmup_counts[batch_size] = count + 1
                     if count < 3:
-                        #print(
-                        #    f"warming eagle graph for batch size {batch_size}")
+                        print(
+                            f"warming eagle graph for batch size {batch_size}")
                         inputs = run_trailing_iterations(
                             runtime_draft_len, inputs, gather_ids,
                             update_attn_metadata_i)
                     elif count == 3:
+                        print(
+                            f"capturing eagle graph for batch size {batch_size}"
+                        )
+                        # After 3 warmup iterations, workspace has been resized
+                        # to the size needed for this batch. Pin it as
+                        # cuda_graph_workspace and mark is_cuda_graph=True so
+                        # thop.attention takes the stable-buffer path (trtllm.py
+                        # line 1379) during graph capture and all future replays.
+                        # Without this, a larger forward during max_shape warmup
+                        # calls resize_() on workspace, changing data_ptr() while
+                        # the graph holds the old address -> cudaErrorIllegalAddress.
+                        capture_attn_meta = inputs["attn_metadata"]
+                        capture_attn_meta.cuda_graph_workspace = capture_attn_meta.workspace
+                        capture_attn_meta.is_cuda_graph = True
                         static_inputs = {
                             "input_ids": inputs["input_ids"].clone(),
                             "position_ids": inputs["position_ids"].clone(),
@@ -797,6 +828,9 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                             batch_size] = make_weak_ref(next_draft_tokens[1:])
                         self._draft_memory_pool = graph.pool()
                     else:
+                        print(
+                            f"using in warmup eagle graph for batch size {batch_size}"
+                        )
                         static_inputs = self._draft_iter_static_inputs[
                             batch_size]
                         static_inputs["input_ids"].copy_(inputs["input_ids"])
@@ -804,28 +838,43 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                             inputs["position_ids"])
                         static_inputs["hidden_states"].copy_(
                             inputs["hidden_states"])
+                        self._update_draft_static_attn(batch_size,
+                                                       attn_metadata)
                         self._draft_iter_graphs[batch_size].replay()
                         next_draft_tokens.extend(
                             self._draft_iter_static_outputs[batch_size])
                 else:
                     graph = self._draft_iter_graphs.get(batch_size)
                     if graph is not None:
+                        print(
+                            f"replaying eagle graph for batch size {batch_size}"
+                        )
+                        print(f"inputs")
                         static_inputs = self._draft_iter_static_inputs[
                             batch_size]
+                        print(f"ids")
                         static_inputs["input_ids"].copy_(inputs["input_ids"])
+                        print(f"positions")
                         static_inputs["position_ids"].copy_(
                             inputs["position_ids"])
+                        print(f"hiddens")
                         static_inputs["hidden_states"].copy_(
                             inputs["hidden_states"])
+                        print(f"update")
+                        self._update_draft_static_attn(batch_size,
+                                                       attn_metadata)
+                        print(f"replay")
                         graph.replay()
                         next_draft_tokens.extend(
                             self._draft_iter_static_outputs[batch_size])
                     else:
+                        print(
+                            f"fallback eagle graph for batch size {batch_size}")
                         inputs = run_trailing_iterations(
                             runtime_draft_len, inputs, gather_ids,
                             update_attn_metadata_i)
             else:
-                #print(f"executing eagle graph for batch size {batch_size}")
+                print(f"executing eagle graph for batch size {batch_size}")
                 inputs = run_trailing_iterations(runtime_draft_len, inputs,
                                                  gather_ids,
                                                  update_attn_metadata_i)

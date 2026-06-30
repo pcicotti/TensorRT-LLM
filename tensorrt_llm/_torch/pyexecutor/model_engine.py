@@ -1158,9 +1158,11 @@ class PyTorchModelEngine(ModelEngine):
                 for batch_size in eagle3_batch_sizes:
                     warmup_request = self._create_warmup_request(
                         resource_manager,
-                        num_tokens=batch_size,
+                        num_tokens=self.max_seq_len - 1 -
+                        self.spec_config.max_draft_len + batch_size - 1,
                         num_gen_requests=0,
-                        least_requests=False)
+                        least_requests=False,
+                        batch_size=batch_size)
                     with self._release_batch_context(warmup_request,
                                                      resource_manager) as batch:
                         if batch is None:
@@ -1241,7 +1243,8 @@ class PyTorchModelEngine(ModelEngine):
             resource_manager: ResourceManager,
             num_tokens: int,
             num_gen_requests: int,
-            least_requests: bool = True) -> Optional[ScheduledRequests]:
+            least_requests: bool = True,
+            batch_size: int = 0) -> Optional[ScheduledRequests]:
         """Creates a generic dummy ScheduledRequests object for warmup."""
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
@@ -1283,26 +1286,36 @@ class PyTorchModelEngine(ModelEngine):
             return None
 
         if num_ctx_tokens > 0:
-            if least_requests:
-                num_full_seqs = num_ctx_tokens // max_seq_len
-                num_left_over_tokens = num_ctx_tokens - num_full_seqs * max_seq_len
-
+            if batch_size:
+                ctx_batch = batch_size - num_gen_requests
+                full_seq_len = 1
+                num_full_seqs = ctx_batch - 1
+            elif least_requests:
+                full_seq_len = max_seq_len
+                num_full_seqs = num_ctx_tokens // full_seq_len
             else:
                 max_bs = min(num_ctx_tokens, max_context_requests)
                 if num_ctx_tokens % max_bs == 0:
                     num_full_seqs = max_bs
                 else:
                     num_full_seqs = max_bs - 1
-                max_seq_len = num_ctx_tokens // num_full_seqs
-                num_left_over_tokens = num_ctx_tokens - max_seq_len * num_full_seqs
+                full_seq_len = num_ctx_tokens // num_full_seqs
+            num_left_over_tokens = num_ctx_tokens - num_full_seqs * full_seq_len
             num_ctx_requests = num_full_seqs + (1 if num_left_over_tokens > 0
                                                 else 0)
+            if batch_size:
+                print(
+                    f'{batch_size}-requests: {num_full_seqs}x1 + 1x{num_left_over_tokens} - {num_ctx_requests}'
+                )
+        else:
+            num_full_seqs = 0
+            full_seq_len = 0
 
         if num_ctx_requests + num_gen_requests > self.batch_size:
             return None  # Not enough batch size to fill the request
 
         blocks_to_use = num_full_seqs * math.ceil(
-            max_seq_len / kv_cache_manager.tokens_per_block) + math.ceil(
+            full_seq_len / kv_cache_manager.tokens_per_block) + math.ceil(
                 num_left_over_tokens / kv_cache_manager.tokens_per_block
             ) + num_gen_requests * self.max_beam_width
 
@@ -1311,7 +1324,7 @@ class PyTorchModelEngine(ModelEngine):
             return None
 
         if num_ctx_tokens > 0:
-            ctx_token_nums = [max_seq_len] * num_full_seqs
+            ctx_token_nums = [full_seq_len] * num_full_seqs
             if num_left_over_tokens > 0:
                 ctx_token_nums.append(num_left_over_tokens)
 
