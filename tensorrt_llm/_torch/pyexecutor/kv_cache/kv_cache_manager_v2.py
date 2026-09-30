@@ -84,7 +84,6 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     gen_multimodal_cache_key_tokens,
     typed_range,
 )
-from tensorrt_llm.runtime.kv_cache_manager_v2 import BACKEND as KV_CACHE_MANAGER_V2_BACKEND
 from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManager as KVCacheManagerPy
 from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManagerConfig as KVCacheManagerConfigPy
 from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfMemoryError as KVCacheOutOfMemoryError
@@ -1285,16 +1284,9 @@ class KVCacheManagerV2(BaseResourceManager):
             kv_events_config is not None and kv_events_config.enable_kv_cache_events
         )
         if streaming_events_enabled:
-            if self.event_buffer_max_size > 0:
-                logger.warning(
-                    "Both kv_cache_config.event_buffer_max_size and streaming "
-                    "kv_events_config are enabled; streaming publishing takes "
-                    "precedence and the buffered get_kv_cache_events() poll path "
-                    "will return no events."
-                )
             assert kv_events_config is not None
-            # Rejects unsupported parallelism, a non-Python V2 backend and colliding
-            # publish/replay port ranges, all before any socket is bound.
+            # Rejects unsupported parallelism and streaming itself, before any socket is
+            # bound and before any claim is made about which event path is in use.
             validate_streaming_support(
                 kv_events_config,
                 pp_size=mapping.pp_size,
@@ -1302,8 +1294,14 @@ class KVCacheManagerV2(BaseResourceManager):
                 # Ranks bind by global rank; only those sharing a host can collide.
                 ranks_per_host=min(mapping.dp_size, mapping.gpus_per_node),
                 data_parallel_size=mapping.dp_size,
-                backend=KV_CACHE_MANAGER_V2_BACKEND,
             )
+            if self.event_buffer_max_size > 0:
+                logger.warning(
+                    "Both kv_cache_config.event_buffer_max_size and streaming "
+                    "kv_events_config are enabled; streaming publishing takes "
+                    "precedence and the buffered get_kv_cache_events() poll path "
+                    "will return no events."
+                )
             if mapping.enable_attention_dp or mpi_rank() == 0:
                 # Constructing it is side-effect free; start() below binds the socket
                 # and starts the publisher thread once every other check has passed.
@@ -2481,23 +2479,6 @@ class KVCacheManagerV2(BaseResourceManager):
         for entry in entries:
             logger.info(entry)
 
-    def _get_attention_op_page_index_params(
-        self, layer_id: LayerId, role: DataRole
-    ) -> Tuple[int, int, int]:
-        """Scale, layer offset and scratch span for one entry per logical block."""
-        converter = self.impl.get_page_index_converter(layer_id, role)
-        if converter.expansion != 1:
-            raise NotImplementedError(
-                "SWA scratch block-table conversion does not support "
-                f"expanded page indices yet: layer={layer_id}, role={role}, "
-                f"expansion={converter.expansion}"
-            )
-        return (
-            int(converter.scale),
-            int(converter.layer_offset),
-            int(converter.scratch_pages_per_block),
-        )
-
     def _prepare_swa_scratch_copy_tensors(self, index_mapper_capacity: int) -> None:
         pool_ids = torch.empty(
             self.num_attention_op_pools,
@@ -2522,13 +2503,17 @@ class KVCacheManagerV2(BaseResourceManager):
                 role_a if role_b is None else role_b,
             ]
             for role_idx, role in enumerate(roles):
-                scale, layer_offset, scratch_span = self._get_attention_op_page_index_params(
-                    layer_id, role
-                )
+                converter = self.impl.get_page_index_converter(layer_id, role)
+                if converter.expansion != 1:
+                    raise NotImplementedError(
+                        "SWA scratch block-table conversion does not support "
+                        f"expanded page indices yet: layer={layer_id}, role={role}, "
+                        f"expansion={converter.expansion}"
+                    )
                 pool_ids[local_layer_idx, role_idx] = pool_id
-                scales[local_layer_idx, role_idx] = scale
-                layer_offsets[local_layer_idx, role_idx] = layer_offset
-                scratch_pages[local_layer_idx, role_idx] = scratch_span
+                scales[local_layer_idx, role_idx] = int(converter.scale)
+                layer_offsets[local_layer_idx, role_idx] = int(converter.layer_offset)
+                scratch_pages[local_layer_idx, role_idx] = int(converter.scratch_pages_per_block)
 
         staging_capacity = index_mapper_capacity * self.max_beam_width
         device = torch.device("cuda", torch.cuda.current_device())
