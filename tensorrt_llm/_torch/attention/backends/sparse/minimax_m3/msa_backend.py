@@ -38,7 +38,7 @@ import torch
 
 from tensorrt_llm._torch.attention.backends.interface import AttentionForwardArgs
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention, TrtllmAttentionMetadata
-from tensorrt_llm._utils import maybe_pin_memory
+from tensorrt_llm._utils import maybe_pin_memory, nvtx_range
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -165,6 +165,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
     # plan, so both forms are staged rather than derived at the call site.
     msa_block_table: Optional[torch.Tensor] = None
     msa_seq_lens_cuda: Optional[torch.Tensor] = None
+    msa_qo_lens_dev: Optional[torch.Tensor] = None
     msa_cu_q_lens: Optional[torch.Tensor] = None
     msa_cu_kv_lens: Optional[torch.Tensor] = None
     # msa_block_table with each slot expanded into the K and V sub-pages the
@@ -237,6 +238,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         """Per-request causal offset (kv_len - qo_len), the cached prefix length."""
         return self._msa_qo_offset_cpu
 
+    @nvtx_range("minimax_m3_msa_stage_host_lengths")
     def _stage_host_lengths(self) -> None:
         """Build this step's per-request host length tensors, once.
 
@@ -451,6 +453,13 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             capture_graph=capture_graph,
         )
         if getattr(kv_cache_manager, "dtype", None) == DataType.NVFP4:
+            self.msa_qo_lens_dev = self.get_empty(
+                buffers,
+                (max_num_sequences,),
+                cache_name="msa_qo_lens_dev",
+                dtype=torch.int32,
+                capture_graph=capture_graph,
+            )
             self.msa_cu_q_lens = self.get_empty(
                 buffers,
                 (max_num_sequences + 1,),
@@ -872,6 +881,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         if n_valid_buf is not None:
             n_valid_buf[:total_q].copy_(n_valid.to(torch.int32))
 
+    @nvtx_range("minimax_m3_msa_build_step_plans")
     def _build_step_plans(self) -> None:
         """Build the layer-invariant fmha_sm100 plans this step still needs.
 
@@ -988,6 +998,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
             dev_buf[:total_q].copy_(n_valid_host.to(torch.int32), non_blocking=True)
             self._msa_prefill_n_valid_blocks = dev_buf[:total_q]
 
+    @nvtx_range("minimax_m3_msa_build_msa_fields")
     def _build_msa_fields(self) -> None:
         """Populate the MSA cache-write buffers for this step.
 
@@ -1019,25 +1030,27 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         # fine: forwards read only the persistent buffers filled below.
         # qo_offset is the prefix length, so one build covers prefill
         # (num_cached) and decode (kv_len - qo_len).
-        mapping = build_paged_kv_slot_mapping(
-            kv_cache_manager=kv_cache_manager,
-            request_ids=request_ids,
-            qo_lens_cpu=qo_lens_cpu,
-            qo_offset_cpu=qo_offset_cpu,
-            device=cache_device,
-        )
+        with nvtx_range("m3_msa_fields_build_paged_kv_slot_mapping"):
+            mapping = build_paged_kv_slot_mapping(
+                kv_cache_manager=kv_cache_manager,
+                request_ids=request_ids,
+                qo_lens_cpu=qo_lens_cpu,
+                qo_offset_cpu=qo_offset_cpu,
+                device=cache_device,
+            )
         out_cache_loc = mapping.out_cache_loc
         # Only fmha_sm100 reads the flattened page table (the decode kernels
         # index msa_block_table directly), so a step with no fmha_sm100 work
         # left skips building and staging it.
         needs_flat_page_table = not self._msa_runs_no_fmha()
-        kv_indices = (
-            # Comes from the same host block ids the mapping was built from,
-            # so it costs no device work.
-            build_kv_page_indices(mapping.block_ids_cpu, kv_lens_cpu, page_size)
-            if needs_flat_page_table
-            else None
-        )
+        with nvtx_range("m3_msa_fields_build_kv_page_indices"):
+            kv_indices = (
+                # Comes from the same host block ids the mapping was built from,
+                # so it costs no device work.
+                build_kv_page_indices(mapping.block_ids_cpu, kv_lens_cpu, page_size)
+                if needs_flat_page_table
+                else None
+            )
         total_new_tokens = int(out_cache_loc.shape[0])
         if total_new_tokens > self.msa_out_cache_loc.shape[0]:
             raise ValueError(
@@ -1066,106 +1079,111 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
                 f"smaller than the step's per-request page count ({block_table_cols})."
             )
 
-        self.msa_out_cache_loc[:total_new_tokens].copy_(out_cache_loc, non_blocking=True)
-        # Captured producers also execute padded rows: the fused index producer
-        # sits inside the captured region, so trimming it to a host-side count
-        # would make its shape dynamic, and a negative slot is what makes those
-        # rows cache-write no-ops instead. Invalidate the unwritten tail so they
-        # cannot reuse the previous step's live slots, which address real pages.
-        if total_new_tokens < self.msa_out_cache_loc.shape[0]:
-            self.msa_out_cache_loc[total_new_tokens:].fill_(-1)
-        if kv_indices is not None:
-            self.msa_kv_indices[: int(kv_indices.shape[0])].copy_(kv_indices, non_blocking=True)
+        with nvtx_range("m3_msa_fields_cache_loc"):
+            self.msa_out_cache_loc[:total_new_tokens].copy_(out_cache_loc, non_blocking=True)
+            # Captured producers also execute padded rows: the fused index producer
+            # sits inside the captured region, so trimming it to a host-side count
+            # would make its shape dynamic, and a negative slot is what makes those
+            # rows cache-write no-ops instead. Invalidate the unwritten tail so they
+            # cannot reuse the previous step's live slots, which address real pages.
+            if total_new_tokens < self.msa_out_cache_loc.shape[0]:
+                self.msa_out_cache_loc[total_new_tokens:].fill_(-1)
+            if kv_indices is not None:
+                self.msa_kv_indices[: int(kv_indices.shape[0])].copy_(kv_indices, non_blocking=True)
 
-        # 2-D page table and per-request length for the decode kernels,
-        # from the same host block ids the flat page table was built from.
-        # Columns past a request's page count are left stale rather than
-        # cleared: every consumer bounds its walk by seq_lens.
-        self.msa_block_table[:batch_size, :block_table_cols].copy_(
-            maybe_pin_memory(block_ids_cpu.to(torch.int32)), non_blocking=True
-        )
-        self.msa_seq_lens_cuda[:batch_size].copy_(kv_lens_cpu, non_blocking=True)
-        if self.msa_cu_q_lens is not None:
-            self._msa_live_batch = batch_size
-            self.msa_cu_q_lens[0].zero_()
-            self.msa_cu_kv_lens[0].zero_()
-            torch.cumsum(
-                maybe_pin_memory(qo_lens_cpu).to(cache_device, non_blocking=True),
-                0,
-                out=self.msa_cu_q_lens[1 : batch_size + 1],
+        with nvtx_range("m3_msa_fields_copies"):
+            # 2-D page table and per-request length for the decode kernels,
+            # from the same host block ids the flat page table was built from.
+            # Columns past a request's page count are left stale rather than
+            # cleared: every consumer bounds its walk by seq_lens.
+            self.msa_block_table[:batch_size, :block_table_cols].copy_(
+                maybe_pin_memory(block_ids_cpu.to(torch.int32)), non_blocking=True
             )
-            torch.cumsum(
-                self.msa_seq_lens_cuda[:batch_size],
-                0,
-                out=self.msa_cu_kv_lens[1 : batch_size + 1],
-            )
-            self._msa_max_q_len = int(qo_lens_cpu.max().item())
-            self._msa_max_kv_len_all = int(kv_lens_cpu.max().item())
-            self._msa_total_k = int(kv_lens_cpu.to(torch.int64).sum().item())
-            self._msa_total_k_rows = int(
-                torch.div(
-                    kv_lens_cpu.to(torch.int64) + page_size - 1,
-                    page_size,
-                    rounding_mode="floor",
+            self.msa_seq_lens_cuda[:batch_size].copy_(kv_lens_cpu, non_blocking=True)
+            if self.msa_cu_q_lens is not None:
+                self._msa_live_batch = batch_size
+                self.msa_cu_q_lens[0].zero_()
+                self.msa_cu_kv_lens[0].zero_()
+                qo_lens_dev = self.msa_qo_lens_dev[:batch_size]
+                qo_lens_dev.copy_(qo_lens_cpu, non_blocking=True)
+                torch.cumsum(
+                    qo_lens_dev,
+                    0,
+                    out=self.msa_cu_q_lens[1 : batch_size + 1],
                 )
-                .sum()
-                .item()
-            )
-            # The same four bounds over the context prefix alone, which is what an
-            # NVFP4 sparse layer's CSR kernel covers once the ported decode kernels
-            # take the generation suffix. Sizing that call from the whole batch
-            # would let a long generation row inflate its worklist.
-            context_rows = min(int(self.num_contexts or 0), batch_size)
-            if context_rows > 0:
-                prefix_kv = kv_lens_cpu[:context_rows].to(torch.int64)
-                self._msa_context_prefix_bounds = (
-                    int(qo_lens_cpu[:context_rows].max().item()),
-                    int(prefix_kv.max().item()),
-                    int(prefix_kv.sum().item()),
-                    int(
-                        torch.div(prefix_kv + page_size - 1, page_size, rounding_mode="floor")
-                        .sum()
-                        .item()
-                    ),
+                torch.cumsum(
+                    self.msa_seq_lens_cuda[:batch_size],
+                    0,
+                    out=self.msa_cu_kv_lens[1 : batch_size + 1],
                 )
-            else:
-                self._msa_context_prefix_bounds = (0, 0, 0, 0)
-        # Sub-page expansion for the trtllm-gen dense layers, staged once here
-        # instead of once per layer, outside capture into a graph-stable
-        # buffer as with the slot table above.
-        if self.msa_subpage_block_table is not None:
-            write_subpage_block_table(
-                self.msa_block_table[:batch_size],
-                self._msa_subpages_per_slot,
-                self.msa_subpage_block_table[:batch_size],
-            )
+                self._msa_max_q_len = int(qo_lens_cpu.max().item())
+                self._msa_max_kv_len_all = int(kv_lens_cpu.max().item())
+                self._msa_total_k = int(kv_lens_cpu.to(torch.int64).sum().item())
+                self._msa_total_k_rows = int(
+                    torch.div(
+                        kv_lens_cpu.to(torch.int64) + page_size - 1,
+                        page_size,
+                        rounding_mode="floor",
+                    )
+                    .sum()
+                    .item()
+                )
+                # The same four bounds over the context prefix alone, which is what an
+                # NVFP4 sparse layer's CSR kernel covers once the ported decode kernels
+                # take the generation suffix. Sizing that call from the whole batch
+                # would let a long generation row inflate its worklist.
+                context_rows = min(int(self.num_contexts or 0), batch_size)
+                if context_rows > 0:
+                    prefix_kv = kv_lens_cpu[:context_rows].to(torch.int64)
+                    self._msa_context_prefix_bounds = (
+                        int(qo_lens_cpu[:context_rows].max().item()),
+                        int(prefix_kv.max().item()),
+                        int(prefix_kv.sum().item()),
+                        int(
+                            torch.div(prefix_kv + page_size - 1, page_size, rounding_mode="floor")
+                            .sum()
+                            .item()
+                        ),
+                    )
+                else:
+                    self._msa_context_prefix_bounds = (0, 0, 0, 0)
+            # Sub-page expansion for the trtllm-gen dense layers, staged once here
+            # instead of once per layer, outside capture into a graph-stable
+            # buffer as with the slot table above.
+            if self.msa_subpage_block_table is not None:
+                write_subpage_block_table(
+                    self.msa_block_table[:batch_size],
+                    self._msa_subpages_per_slot,
+                    self.msa_subpage_block_table[:batch_size],
+                )
 
-        self._msa_kv_lens_dynamic = self._msa_kv_lens_may_change()
-        if not self._msa_kv_lens_dynamic:
-            self._msa_fields_ready = True
-            return
+            self._msa_kv_lens_dynamic = self._msa_kv_lens_may_change()
+            if not self._msa_kv_lens_dynamic:
+                self._msa_fields_ready = True
+                return
 
         # Inputs for on_update_kv_lens: each query token's (request row, offset
         # in request). Pinned and non-blocking so the copies do not synchronize
         # the stream. The slots themselves come from msa_block_table above.
-        qo_long = qo_lens_cpu.to(torch.long)
-        batch_row_cpu = torch.repeat_interleave(
-            torch.arange(batch_size, dtype=torch.int32), qo_long
-        )
-        starts = torch.cumsum(qo_long, 0) - qo_long
-        intra_cpu = (
-            torch.arange(total_new_tokens, dtype=torch.int64)
-            - torch.repeat_interleave(starts, qo_long)
-        ).to(torch.int32)
-        self.msa_q_batch_row[:total_new_tokens].copy_(
-            maybe_pin_memory(batch_row_cpu), non_blocking=True
-        )
-        self.msa_q_intra[:total_new_tokens].copy_(maybe_pin_memory(intra_cpu), non_blocking=True)
-        # The staged lens are the upper bound on_update_kv_lens clamps to: the
-        # same attended lengths msa_seq_lens_cuda was just filled from, kept
-        # apart so the clamp stays fixed however often the hook runs.
-        self.msa_kv_lens_staged[:batch_size].copy_(kv_lens_cpu, non_blocking=True)
-        self._msa_fields_ready = True
+        with nvtx_range("m3_msa_fields_compute"):
+            qo_long = qo_lens_cpu.to(torch.long)
+            batch_row_cpu = torch.repeat_interleave(
+                torch.arange(batch_size, dtype=torch.int32), qo_long
+            )
+            starts = torch.cumsum(qo_long, 0) - qo_long
+            intra_cpu = (
+                torch.arange(total_new_tokens, dtype=torch.int64)
+                - torch.repeat_interleave(starts, qo_long)
+            ).to(torch.int32)
+            self.msa_q_batch_row[:total_new_tokens].copy_(
+                maybe_pin_memory(batch_row_cpu), non_blocking=True
+            )
+            self.msa_q_intra[:total_new_tokens].copy_(maybe_pin_memory(intra_cpu), non_blocking=True)
+            # The staged lens are the upper bound on_update_kv_lens clamps to: the
+            # same attended lengths msa_seq_lens_cuda was just filled from, kept
+            # apart so the clamp stays fixed however often the hook runs.
+            self.msa_kv_lens_staged[:batch_size].copy_(kv_lens_cpu, non_blocking=True)
+            self._msa_fields_ready = True
 
     def msa_idx_k_cache(self, layer_idx: int) -> torch.Tensor:
         """Return the paged index-K cache in the HND layout MSA consumes."""
